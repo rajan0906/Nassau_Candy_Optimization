@@ -316,10 +316,9 @@ st.sidebar.header("Optimization Simulator")
 selected_product = st.sidebar.selectbox("Product", sorted(df["Product Name"].unique()))
 selected_region = st.sidebar.selectbox("Destination Region", sorted(df["Region"].unique()))
 selected_ship_mode = st.sidebar.selectbox("Ship Mode", sorted(df["Ship Mode"].unique()))
-selected_order_date = st.sidebar.date_input(
-    "Order Date", value=df["Order Date"].max().date(),
-    min_value=df["Order Date"].min().date(), max_value=df["Order Date"].max().date(),
-)
+# The brief only requires product, region, ship mode, and priority controls.
+# Use the latest observed order date internally for a consistent scenario forecast.
+scenario_order_date = df["Order Date"].max().date()
 priority = st.sidebar.slider("Optimization Priority: Speed vs Profit", 0, 100, 50)
 max_recommendations = min(15, df["Product Name"].nunique())
 top_n = st.sidebar.slider(
@@ -328,14 +327,14 @@ top_n = st.sidebar.slider(
 
 scenario_df = scenario_table(
     df, model, selected_product, selected_region, selected_ship_mode,
-    selected_order_date, priority, test_r2
+    scenario_order_date, priority, test_r2
 )
 current_factory = PRODUCT_FACTORY_MAP[selected_product]
 best_recommendation = scenario_df.loc[
     scenario_df["Recommendation"] == "Recommended"
 ].head(1)
 all_recommendations = build_recommendations(
-    df, model, selected_region, selected_ship_mode, selected_order_date, priority, test_r2
+    df, model, selected_region, selected_ship_mode, scenario_order_date, priority, test_r2
 )
 
 coverage = 100 * all_recommendations["Product"].nunique() / df["Product Name"].nunique() if not all_recommendations.empty else 0.0
@@ -423,7 +422,12 @@ with risk1:
         st.warning(f"Estimated profit risk: ${abs(total_profit_impact):,.2f}.")
 with risk2:
     negative_options = int((scenario_df["Lead Time Reduction Days"] < 0).sum())
-    st.warning(f"{negative_options} factory option(s) are slower than the current assignment.") if negative_options else st.success("No slower option was predicted for this scenario.")
+    if negative_options:
+        st.warning(
+            f"{negative_options} factory option(s) are slower than the current assignment."
+        )
+    else:
+        st.success("No slower option was predicted for this scenario.")
 
 st.subheader("Route & Product Clustering")
 route_df = create_route_clusters(df)
