@@ -17,21 +17,15 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(
-    page_title="Nassau Candy Factory Reallocation",
-    layout="wide",
-)
-
-st.title("Factory Reallocation & Shipping Optimization Recommendation System")
-st.caption("Nassau Candy Distributor")
+st.set_page_config(page_title="Nassau Candy Factory Reallocation", layout="wide")
 
 
 FACTORY_COORDS = {
     "Lot's O' Nuts": {"lat": 32.881893, "lon": -111.768036},
     "Wicked Choccy's": {"lat": 32.076176, "lon": -81.088371},
-    "Sugar Shack": {"lat": 48.11914, "lon": -96.18115},
+    "Sugar Shack": {"lat": 48.119140, "lon": -96.181150},
     "Secret Factory": {"lat": 41.446333, "lon": -90.565487},
-    "The Other Factory": {"lat": 35.1175, "lon": -89.971107},
+    "The Other Factory": {"lat": 35.117500, "lon": -89.971107},
 }
 
 PRODUCT_FACTORY_MAP = {
@@ -53,422 +47,336 @@ PRODUCT_FACTORY_MAP = {
 }
 
 REQUIRED_COLUMNS = [
-    "Row ID",
-    "Order ID",
-    "Order Date",
-    "Ship Date",
-    "Ship Mode",
-    "Region",
-    "Division",
-    "Product Name",
-    "Sales",
-    "Units",
-    "Gross Profit",
-    "Cost",
+    "Order ID", "Order Date", "Ship Date", "Ship Mode", "Region",
+    "Product Name", "Sales", "Units", "Gross Profit", "Cost",
 ]
-
-MODEL_FEATURES = ["Product Name", "Origin Factory", "Region", "Ship Mode"]
-FACTORIES = list(FACTORY_COORDS.keys())
+CATEGORICAL_FEATURES = ["Product Name", "Origin Factory", "Region", "Ship Mode"]
+NUMERIC_FEATURES = ["Order Day Number", "Order Month", "Order Weekday"]
+MODEL_FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
+FACTORIES = list(FACTORY_COORDS)
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
-    parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
-    if parsed.isna().mean() > 0.5:
-        parsed = pd.to_datetime(series, errors="coerce")
+    """Parse the CSV's DD-MM-YYYY dates explicitly; never guess the format."""
+    parsed = pd.to_datetime(series.astype(str).str.strip(), format="%d-%m-%Y", errors="coerce")
+    if parsed.isna().any():
+        bad_count = int(parsed.isna().sum())
+        raise ValueError(f"{bad_count:,} date value(s) are not in DD-MM-YYYY format.")
     return parsed
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def read_default_csv() -> pd.DataFrame:
     possible_files = [
         Path("Nassau Candy Distributor.csv"),
         Path("Nassau Candy Distributor (1).csv"),
-        Path("Nassau_Candy_Distributor.csv"),
-        Path("Nassau_Candy_Distributor__1_.csv"),
         Path.home() / "Downloads" / "Nassau Candy Distributor.csv",
         Path.home() / "Downloads" / "Nassau Candy Distributor (1).csv",
     ]
     for file_name in possible_files:
         if file_name.exists():
             return pd.read_csv(file_name)
-    raise FileNotFoundError(
-        "Put the Nassau Candy Distributor CSV in this app folder or upload it in the sidebar."
-    )
+    raise FileNotFoundError("Upload the Nassau Candy Distributor CSV in the sidebar.")
 
 
 def prepare_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing:
-        st.error(f"Missing required columns: {', '.join(missing)}")
-        st.stop()
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
     df["Order Date"] = parse_dates(df["Order Date"])
     df["Ship Date"] = parse_dates(df["Ship Date"])
     df["Lead Time"] = (df["Ship Date"] - df["Order Date"]).dt.days
     df["Origin Factory"] = df["Product Name"].map(PRODUCT_FACTORY_MAP)
 
-    numeric_cols = ["Sales", "Units", "Gross Profit", "Cost", "Lead Time"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in ["Sales", "Units", "Gross Profit", "Cost"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    df = df.dropna(subset=MODEL_FEATURES + ["Lead Time", "Gross Profit"]).copy()
+    df = df.dropna(
+        subset=CATEGORICAL_FEATURES + ["Order Date", "Ship Date", "Lead Time", "Gross Profit"]
+    ).copy()
     df = df[df["Lead Time"] >= 0].copy()
+    if len(df) < 100:
+        raise ValueError("At least 100 valid rows are required to train and evaluate the models.")
 
-    q1 = df["Lead Time"].quantile(0.25)
-    q3 = df["Lead Time"].quantile(0.75)
-    iqr = q3 - q1
-    if iqr > 0:
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        df = df[df["Lead Time"].between(lower, upper)].copy()
-
+    first_order_date = df["Order Date"].min()
+    df["Order Day Number"] = (df["Order Date"] - first_order_date).dt.days
+    df["Order Month"] = df["Order Date"].dt.month
+    df["Order Weekday"] = df["Order Date"].dt.dayofweek
     return df.reset_index(drop=True)
 
 
 def load_data() -> pd.DataFrame:
     uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file is not None:
-        raw = pd.read_csv(uploaded_file)
-    else:
-        raw = read_default_csv()
-    return prepare_data(raw)
+    try:
+        raw_df = pd.read_csv(uploaded_file) if uploaded_file else read_default_csv()
+        return prepare_data(raw_df)
+    except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
+        st.error(str(exc))
+        st.stop()
 
 
-@st.cache_resource
+def make_pipeline(model) -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_FEATURES),
+            ("numeric", StandardScaler(), NUMERIC_FEATURES),
+        ],
+        sparse_threshold=0,
+    )
+    return Pipeline([( "preprocess", preprocessor), ("model", model)])
+
+
+@st.cache_resource(show_spinner=False)
 def train_models(data: pd.DataFrame):
     x = data[MODEL_FEATURES]
     y = data["Lead Time"]
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=0.20, random_state=42
+    )
 
-    models = {
+    candidates = {
         "Linear Regression": LinearRegression(),
         "Random Forest Regressor": RandomForestRegressor(
-            n_estimators=250,
-            min_samples_leaf=3,
-            random_state=42,
-            n_jobs=-1,
+            n_estimators=300, min_samples_leaf=4, random_state=42, n_jobs=-1
         ),
-        "Gradient Boosting Regressor": GradientBoostingRegressor(random_state=42),
+        "Gradient Boosting Regressor": GradientBoostingRegressor(
+            n_estimators=200, learning_rate=0.05, max_depth=2, random_state=42
+        ),
     }
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.2, random_state=42
-    )
+    fitted_models, results = {}, []
+    baseline_prediction = np.full(len(y_test), y_train.mean())
+    baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_prediction)))
+    baseline_mae = float(mean_absolute_error(y_test, baseline_prediction))
 
-    results = []
-    best_name = None
-    best_pipeline = None
-    best_score = -np.inf
-
-    for name, model in models.items():
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("cat", OneHotEncoder(handle_unknown="ignore"), MODEL_FEATURES),
-            ],
-            remainder="drop",
-        )
-        pipeline = Pipeline(
-            steps=[
-                ("preprocess", preprocessor),
-                ("model", model),
-            ]
-        )
+    for name, estimator in candidates.items():
+        pipeline = make_pipeline(estimator)
         pipeline.fit(x_train, y_train)
-        predictions = pipeline.predict(x_test)
-        rmse = np.sqrt(mean_squared_error(y_test, predictions))
-        mae = mean_absolute_error(y_test, predictions)
-        r2 = r2_score(y_test, predictions)
-        results.append({"Model": name, "RMSE": rmse, "MAE": mae, "R2": r2})
+        prediction = pipeline.predict(x_test)
+        results.append({
+            "Model": name,
+            "RMSE": float(np.sqrt(mean_squared_error(y_test, prediction))),
+            "MAE": float(mean_absolute_error(y_test, prediction)),
+            "R2": float(r2_score(y_test, prediction)),
+        })
+        fitted_models[name] = pipeline
 
-        selection_score = r2 - (rmse / max(y.mean(), 1))
-        if selection_score > best_score:
-            best_score = selection_score
-            best_name = name
-            best_pipeline = pipeline
-
-    metrics_df = pd.DataFrame(results).sort_values("R2", ascending=False)
-    best_metrics = metrics_df[metrics_df["Model"] == best_name].iloc[0].to_dict()
-    return best_pipeline, best_name, best_metrics, metrics_df
-
-
-def predict_lead_time(model, product: str, factory: str, region: str, ship_mode: str) -> float:
-    scenario = pd.DataFrame(
-        [
-            {
-                "Product Name": product,
-                "Origin Factory": factory,
-                "Region": region,
-                "Ship Mode": ship_mode,
-            }
-        ]
-    )
-    return max(float(model.predict(scenario)[0]), 0.0)
+    metrics_df = pd.DataFrame(results).sort_values(["RMSE", "MAE"], ascending=True)
+    best_name = metrics_df.iloc[0]["Model"]
+    best_metrics = metrics_df.iloc[0].to_dict()
+    best_metrics["Baseline RMSE"] = baseline_rmse
+    best_metrics["Baseline MAE"] = baseline_mae
+    return fitted_models[best_name], best_name, best_metrics, metrics_df
 
 
-def average_profit(data: pd.DataFrame, product: str, region: str, ship_mode: str) -> float:
-    subset = data[
+def predict_lead_time(model, product, factory, region, ship_mode, order_date) -> float:
+    first_order_date = st.session_state["first_order_date"]
+    order_timestamp = pd.Timestamp(order_date)
+    scenario = pd.DataFrame([{
+        "Product Name": product,
+        "Origin Factory": factory,
+        "Region": region,
+        "Ship Mode": ship_mode,
+        "Order Day Number": (order_timestamp - first_order_date).days,
+        "Order Month": order_timestamp.month,
+        "Order Weekday": order_timestamp.dayofweek,
+    }])
+    return max(0.0, float(model.predict(scenario)[0]))
+
+
+def average_profit(data, product, region, ship_mode) -> float:
+    subset = data.loc[
         (data["Product Name"] == product)
         & (data["Region"] == region)
-        & (data["Ship Mode"] == ship_mode)
+        & (data["Ship Mode"] == ship_mode),
+        "Gross Profit",
     ]
     if subset.empty:
-        subset = data[data["Product Name"] == product]
-    if subset.empty:
-        return float(data["Gross Profit"].mean())
-    return float(subset["Gross Profit"].mean())
+        subset = data.loc[data["Product Name"] == product, "Gross Profit"]
+    return float(subset.mean()) if not subset.empty else float(data["Gross Profit"].mean())
 
 
-def scenario_table(
-    data: pd.DataFrame,
-    model,
-    best_mae: float,
-    product: str,
-    region: str,
-    ship_mode: str,
-    priority: int,
-) -> pd.DataFrame:
+def scenario_table(data, model, product, region, ship_mode, order_date, priority, test_r2):
     current_factory = PRODUCT_FACTORY_MAP[product]
-    current_lead = predict_lead_time(model, product, current_factory, region, ship_mode)
+    current_lead = predict_lead_time(
+        model, product, current_factory, region, ship_mode, order_date
+    )
     base_profit = average_profit(data, product, region, ship_mode)
-    weight_speed = priority / 100
-    weight_profit = 1 - weight_speed
+    speed_weight = priority / 100
+    profit_weight = 1 - speed_weight
     rows = []
 
     for factory in FACTORIES:
-        predicted_lead = predict_lead_time(model, product, factory, region, ship_mode)
-        lead_reduction_days = current_lead - predicted_lead
-        lead_reduction_pct = (
-            (lead_reduction_days / current_lead) * 100 if current_lead > 0 else 0
+        predicted_lead = predict_lead_time(
+            model, product, factory, region, ship_mode, order_date
         )
-        profit_impact = base_profit * (lead_reduction_pct / 100) * 0.25
-        confidence = max(0, min(100, 100 - (best_mae / max(predicted_lead, 1)) * 100))
-        risk_reduction = lead_reduction_pct * 0.7 + confidence * 0.3
+        reduction_days = current_lead - predicted_lead
+        reduction_pct = 100 * reduction_days / current_lead if current_lead else 0.0
+        # This is an explicit planning estimate, not a historical causal profit result.
+        profit_impact = base_profit * (reduction_pct / 100) * 0.25
+        confidence = max(0.0, min(100.0, test_r2 * 100))
         score = (
-            weight_speed * lead_reduction_pct
-            + weight_profit * (profit_impact / max(abs(base_profit), 1) * 100)
-            + 0.25 * risk_reduction
+            speed_weight * reduction_pct
+            + profit_weight * (profit_impact / max(abs(base_profit), 1) * 100)
         )
-
         if factory == current_factory:
             recommendation = "Current Factory"
-        elif lead_reduction_days <= 0:
+        elif test_r2 <= 0:
+            recommendation = "Model Not Reliable"
+        elif reduction_days <= 0:
             recommendation = "Do Not Reassign"
-        elif profit_impact < 0:
-            recommendation = "High Risk"
         else:
             recommendation = "Recommended"
 
-        rows.append(
-            {
-                "Product": product,
-                "Region": region,
-                "Ship Mode": ship_mode,
-                "Factory": factory,
-                "Current Factory": current_factory,
-                "Predicted Lead Time": predicted_lead,
-                "Lead Time Reduction Days": lead_reduction_days,
-                "Lead Time Reduction (%)": lead_reduction_pct,
-                "Profit Impact": profit_impact,
-                "Scenario Confidence Score": confidence,
-                "Risk Reduction Score": risk_reduction,
-                "Optimization Score": score,
-                "Recommendation": recommendation,
-            }
-        )
-
-    result = pd.DataFrame(rows)
-    return result.sort_values("Optimization Score", ascending=False).reset_index(drop=True)
+        rows.append({
+            "Product": product,
+            "Region": region,
+            "Ship Mode": ship_mode,
+            "Factory": factory,
+            "Current Factory": current_factory,
+            "Predicted Lead Time": predicted_lead,
+            "Lead Time Reduction Days": reduction_days,
+            "Lead Time Reduction (%)": reduction_pct,
+            "Estimated Profit Impact": profit_impact,
+            "Scenario Confidence Score": confidence,
+            "Optimization Score": score,
+            "Recommendation": recommendation,
+        })
+    return pd.DataFrame(rows).sort_values("Optimization Score", ascending=False).reset_index(drop=True)
 
 
-def build_all_recommendations(
-    data: pd.DataFrame,
-    model,
-    selected_region: str,
-    selected_ship_mode: str,
-    priority: int,
-    best_mae: float,
-) -> pd.DataFrame:
-    tables = []
-    for product in sorted(data["Product Name"].dropna().unique()):
+def build_recommendations(data, model, region, ship_mode, order_date, priority, test_r2):
+    recommendations = []
+    for product in sorted(data["Product Name"].unique()):
         table = scenario_table(
-            data,
-            model,
-            best_mae,
-            product,
-            selected_region,
-            selected_ship_mode,
-            priority,
+            data, model, product, region, ship_mode, order_date, priority, test_r2
         )
-        current_factory = PRODUCT_FACTORY_MAP[product]
-        viable = table[
-            (table["Factory"] != current_factory)
-            & (table["Lead Time Reduction Days"] > 0)
-            & (table["Profit Impact"] >= 0)
-        ].copy()
+        viable = table.loc[table["Recommendation"] == "Recommended"]
         if not viable.empty:
-            tables.append(viable.head(1))
-
-    if not tables:
+            recommendations.append(viable.head(1))
+    if not recommendations:
         return pd.DataFrame()
-    return pd.concat(tables, ignore_index=True).sort_values(
+    return pd.concat(recommendations, ignore_index=True).sort_values(
         "Optimization Score", ascending=False
     )
 
 
-def create_route_clusters(data: pd.DataFrame) -> pd.DataFrame:
-    route_df = (
-        data.groupby(["Origin Factory", "Region", "Product Name"], as_index=False)
-        .agg(
-            Avg_Lead_Time=("Lead Time", "mean"),
-            Total_Orders=("Order ID", "count"),
-            Avg_Gross_Profit=("Gross Profit", "mean"),
-        )
-        .copy()
+@st.cache_data(show_spinner=False)
+def create_route_clusters(data):
+    route_df = data.groupby(["Origin Factory", "Region", "Product Name"], as_index=False).agg(
+        Avg_Lead_Time=("Lead Time", "mean"),
+        Total_Orders=("Order ID", "count"),
+        Avg_Gross_Profit=("Gross Profit", "mean"),
     )
-
-    features = route_df[["Avg_Lead_Time", "Total_Orders", "Avg_Gross_Profit"]]
-    scaled = StandardScaler().fit_transform(features)
-    k = min(3, len(route_df))
-    route_df["Cluster"] = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(
-        scaled
+    cluster_count = min(3, len(route_df))
+    if cluster_count < 2:
+        route_df["Status"] = "Insufficient route variation"
+        return route_df
+    values = StandardScaler().fit_transform(
+        route_df[["Avg_Lead_Time", "Total_Orders", "Avg_Gross_Profit"]]
     )
-
-    cluster_summary = route_df.groupby("Cluster")["Avg_Lead_Time"].mean().sort_values()
-    labels = {}
-    ordered_clusters = list(cluster_summary.index)
-    for position, cluster in enumerate(ordered_clusters):
-        if position == 0:
-            labels[cluster] = "Optimal / Standard"
-        elif position == len(ordered_clusters) - 1:
-            labels[cluster] = "Congested / Slow Route"
-        else:
-            labels[cluster] = "High Volume / Monitor"
-
+    route_df["Cluster"] = KMeans(
+        n_clusters=cluster_count, random_state=42, n_init=10
+    ).fit_predict(values)
+    ranking = route_df.groupby("Cluster")["Avg_Lead_Time"].mean().sort_values().index.tolist()
+    labels = {ranking[0]: "Optimal / Standard", ranking[-1]: "Congested / Slow Route"}
+    for cluster in ranking[1:-1]:
+        labels[cluster] = "High Volume / Monitor"
     route_df["Status"] = route_df["Cluster"].map(labels)
     return route_df
 
 
-def format_recommendations(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "Product",
-        "Current Factory",
-        "Factory",
-        "Predicted Lead Time",
-        "Lead Time Reduction (%)",
-        "Profit Impact",
-        "Scenario Confidence Score",
-        "Risk Reduction Score",
-        "Optimization Score",
-        "Recommendation",
+def display_table(frame):
+    columns = [
+        "Product", "Current Factory", "Factory", "Predicted Lead Time",
+        "Lead Time Reduction (%)", "Estimated Profit Impact",
+        "Scenario Confidence Score", "Optimization Score", "Recommendation",
     ]
-    return df[cols].rename(columns={"Factory": "Move To"})
+    return frame[columns].rename(columns={"Factory": "Move To"})
 
 
 df = load_data()
+st.session_state["first_order_date"] = df["Order Date"].min()
 model, winning_model_name, best_metrics, metrics_df = train_models(df)
-st.session_state["model"] = model
+test_r2 = float(best_metrics["R2"])
+
+st.title("Factory Reallocation & Shipping Optimization Recommendation System")
+st.caption("Nassau Candy Distributor")
+
+median_lead_time = float(df["Lead Time"].median())
+if median_lead_time > 60:
+    st.warning(
+        f"Data quality notice: the uploaded CSV has a median lead time of {median_lead_time:,.0f} days. "
+        "Verify Order Date and Ship Date before using these outputs for an operational decision."
+    )
 
 st.sidebar.header("Optimization Simulator")
-selected_product = st.sidebar.selectbox(
-    "Product", sorted(df["Product Name"].dropna().unique())
-)
+selected_product = st.sidebar.selectbox("Product", sorted(df["Product Name"].unique()))
 selected_region = st.sidebar.selectbox("Destination Region", sorted(df["Region"].unique()))
 selected_ship_mode = st.sidebar.selectbox("Ship Mode", sorted(df["Ship Mode"].unique()))
-optimization_priority = st.sidebar.slider(
-    "Optimization Priority: Speed vs Profit",
-    min_value=0,
-    max_value=100,
-    value=50,
-    help="0 = prioritize profit stability, 100 = prioritize lead-time reduction",
+selected_order_date = st.sidebar.date_input(
+    "Order Date", value=df["Order Date"].max().date(),
+    min_value=df["Order Date"].min().date(), max_value=df["Order Date"].max().date(),
 )
-top_n = st.sidebar.slider("Top-N Recommendations", 3, 15, 10)
+priority = st.sidebar.slider("Optimization Priority: Speed vs Profit", 0, 100, 50)
+max_recommendations = min(15, df["Product Name"].nunique())
+top_n = st.sidebar.slider(
+    "Top-N Recommendations", 3, max_recommendations, min(10, max_recommendations)
+)
 
 scenario_df = scenario_table(
-    df,
-    model,
-    float(best_metrics["MAE"]),
-    selected_product,
-    selected_region,
-    selected_ship_mode,
-    optimization_priority,
+    df, model, selected_product, selected_region, selected_ship_mode,
+    selected_order_date, priority, test_r2
 )
-
 current_factory = PRODUCT_FACTORY_MAP[selected_product]
-recommended_df = scenario_df[
-    (scenario_df["Factory"] != current_factory)
-    & (scenario_df["Lead Time Reduction Days"] > 0)
-    & (scenario_df["Profit Impact"] >= 0)
-].copy()
-best_recommendation = (
-    recommended_df.iloc[0] if not recommended_df.empty else scenario_df.iloc[0]
+best_recommendation = scenario_df.loc[
+    scenario_df["Recommendation"] == "Recommended"
+].head(1)
+all_recommendations = build_recommendations(
+    df, model, selected_region, selected_ship_mode, selected_order_date, priority, test_r2
 )
 
-all_recommendations = build_all_recommendations(
-    df,
-    model,
-    selected_region,
-    selected_ship_mode,
-    optimization_priority,
-    float(best_metrics["MAE"]),
-)
-
-coverage = (
-    all_recommendations["Product"].nunique() / df["Product Name"].nunique() * 100
-    if not all_recommendations.empty
-    else 0
-)
-avg_reduction = (
-    all_recommendations["Lead Time Reduction (%)"].mean()
-    if not all_recommendations.empty
-    else 0
-)
-total_profit_impact = (
-    all_recommendations["Profit Impact"].sum() if not all_recommendations.empty else 0
-)
-avg_confidence = (
-    all_recommendations["Scenario Confidence Score"].mean()
-    if not all_recommendations.empty
-    else scenario_df["Scenario Confidence Score"].mean()
-)
+coverage = 100 * all_recommendations["Product"].nunique() / df["Product Name"].nunique() if not all_recommendations.empty else 0.0
+avg_reduction = float(all_recommendations["Lead Time Reduction (%)"].mean()) if not all_recommendations.empty else 0.0
+total_profit_impact = float(all_recommendations["Estimated Profit Impact"].sum()) if not all_recommendations.empty else 0.0
 
 st.subheader("Key Performance Indicators")
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("Lead Time Reduction", f"{avg_reduction:.1f}%")
-kpi2.metric("Profit Impact Stability", f"${total_profit_impact:,.2f}")
-kpi3.metric("Scenario Confidence", f"{avg_confidence:.1f}%")
-kpi4.metric("Recommendation Coverage", f"{coverage:.1f}%")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Lead Time Reduction", f"{avg_reduction:.1f}%")
+k2.metric("Estimated Profit Impact", f"${total_profit_impact:,.2f}")
+k3.metric("Scenario Confidence", f"{max(test_r2, 0) * 100:.1f}%")
+k4.metric("Recommendation Coverage", f"{coverage:.1f}%")
 
 st.subheader("Model Evaluation")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Selected Model", winning_model_name)
 m2.metric("RMSE", f"{best_metrics['RMSE']:.2f}")
 m3.metric("MAE", f"{best_metrics['MAE']:.2f}")
-m4.metric("R2", f"{best_metrics['R2']:.4f}")
+m4.metric("R2", f"{test_r2:.4f}")
+if test_r2 <= 0:
+    st.error(
+        "The best model does not outperform the mean-lead-time baseline. "
+        "Recommendations are disabled until the source dates or additional routing data are corrected."
+    )
+else:
+    st.success("The selected model outperforms the mean-lead-time baseline on the held-out test set.")
 with st.expander("Compare all trained models"):
-    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+    st.dataframe(metrics_df.style.format({"RMSE": "{:.2f}", "MAE": "{:.2f}", "R2": "{:.4f}"}), use_container_width=True, hide_index=True)
 
 st.subheader("Factory Optimization Simulator")
 st.dataframe(
-    format_recommendations(scenario_df).style.format(
-        {
-            "Predicted Lead Time": "{:.2f}",
-            "Lead Time Reduction (%)": "{:.2f}",
-            "Profit Impact": "${:,.2f}",
-            "Scenario Confidence Score": "{:.1f}",
-            "Risk Reduction Score": "{:.1f}",
-            "Optimization Score": "{:.1f}",
-        }
-    ),
-    use_container_width=True,
-    hide_index=True,
+    display_table(scenario_df).style.format({
+        "Predicted Lead Time": "{:.2f}", "Lead Time Reduction (%)": "{:.2f}",
+        "Estimated Profit Impact": "${:,.2f}", "Scenario Confidence Score": "{:.1f}",
+        "Optimization Score": "{:.1f}",
+    }), use_container_width=True, hide_index=True,
 )
 
 fig_factory = px.bar(
-    scenario_df.sort_values("Predicted Lead Time"),
-    x="Factory",
-    y="Predicted Lead Time",
-    color="Recommendation",
-    text="Predicted Lead Time",
+    scenario_df.sort_values("Predicted Lead Time"), x="Factory", y="Predicted Lead Time",
+    color="Recommendation", text="Predicted Lead Time",
     title=f"Predicted Performance Across Factories: {selected_product}",
 )
 fig_factory.update_traces(texttemplate="%{text:.1f}", textposition="outside")
@@ -476,107 +384,56 @@ fig_factory.update_layout(yaxis_title="Predicted Lead Time (Days)")
 st.plotly_chart(fig_factory, use_container_width=True)
 
 st.subheader("What-If Scenario Analysis")
-current_row = scenario_df[scenario_df["Factory"] == current_factory].iloc[0]
-comparison_df = pd.DataFrame(
-    [
-        {
-            "Scenario": "Current Assignment",
-            "Factory": current_factory,
-            "Predicted Lead Time": current_row["Predicted Lead Time"],
-        },
-        {
-            "Scenario": "Recommended Assignment",
-            "Factory": best_recommendation["Factory"],
-            "Predicted Lead Time": best_recommendation["Predicted Lead Time"],
-        },
-    ]
-)
-left, right = st.columns([1, 1])
+current_row = scenario_df.loc[scenario_df["Factory"] == current_factory].iloc[0]
+comparison_rows = [{"Scenario": "Current Assignment", "Factory": current_factory, "Predicted Lead Time": current_row["Predicted Lead Time"]}]
+if not best_recommendation.empty:
+    row = best_recommendation.iloc[0]
+    comparison_rows.append({"Scenario": "Recommended Assignment", "Factory": row["Factory"], "Predicted Lead Time": row["Predicted Lead Time"]})
+comparison_df = pd.DataFrame(comparison_rows)
+left, right = st.columns(2)
 with left:
-    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    st.dataframe(comparison_df.style.format({"Predicted Lead Time": "{:.2f}"}), use_container_width=True, hide_index=True)
 with right:
-    fig_what_if = px.bar(
-        comparison_df,
-        x="Scenario",
-        y="Predicted Lead Time",
-        color="Factory",
-        text="Predicted Lead Time",
-        title="Current vs Recommended Assignment",
-    )
+    fig_what_if = px.bar(comparison_df, x="Scenario", y="Predicted Lead Time", color="Factory", text="Predicted Lead Time")
     fig_what_if.update_traces(texttemplate="%{text:.1f}", textposition="outside")
     st.plotly_chart(fig_what_if, use_container_width=True)
 
 st.subheader("Recommendation Dashboard")
 if all_recommendations.empty:
-    st.info("No positive, profit-stable reassignment recommendations for this filter.")
+    st.info("No data-supported positive reassignment recommendation exists for the selected filters.")
 else:
     top_recommendations = all_recommendations.head(top_n)
-    st.dataframe(
-        format_recommendations(top_recommendations).style.format(
-            {
-                "Predicted Lead Time": "{:.2f}",
-                "Lead Time Reduction (%)": "{:.2f}",
-                "Profit Impact": "${:,.2f}",
-                "Scenario Confidence Score": "{:.1f}",
-                "Risk Reduction Score": "{:.1f}",
-                "Optimization Score": "{:.1f}",
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    fig_gain = px.bar(
-        top_recommendations,
-        x="Product",
-        y="Lead Time Reduction (%)",
-        color="Factory",
-        title="Expected Efficiency Gains by Product",
-        text="Lead Time Reduction (%)",
-    )
+    st.dataframe(display_table(top_recommendations).style.format({
+        "Predicted Lead Time": "{:.2f}", "Lead Time Reduction (%)": "{:.2f}",
+        "Estimated Profit Impact": "${:,.2f}", "Scenario Confidence Score": "{:.1f}", "Optimization Score": "{:.1f}",
+    }), use_container_width=True, hide_index=True)
+    fig_gain = px.bar(top_recommendations, x="Product", y="Lead Time Reduction (%)", color="Factory", text="Lead Time Reduction (%)", title="Expected Efficiency Gains by Product")
     fig_gain.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
     fig_gain.update_layout(xaxis_tickangle=-30)
     st.plotly_chart(fig_gain, use_container_width=True)
 
 st.subheader("Risk & Impact Panel")
-risk_col1, risk_col2 = st.columns(2)
-with risk_col1:
-    if total_profit_impact >= 0:
-        st.success(f"Profit impact alert: stable positive impact of ${total_profit_impact:,.2f}.")
+risk1, risk2 = st.columns(2)
+with risk1:
+    if test_r2 <= 0:
+        st.error("Model risk: do not use the forecast for an operational reassignment decision.")
+    elif total_profit_impact >= 0:
+        st.success(f"Estimated profit impact: ${total_profit_impact:,.2f}.")
     else:
-        st.error(f"Profit impact alert: potential loss of ${abs(total_profit_impact):,.2f}.")
-with risk_col2:
-    high_risk_count = int(
-        (scenario_df["Scenario Confidence Score"] < 60).sum()
-        + (scenario_df["Lead Time Reduction Days"] < 0).sum()
-    )
-    if high_risk_count > 0:
-        st.warning(f"High-risk reassignment warning: {high_risk_count} scenario(s) need review.")
-    else:
-        st.success("No high-risk warning for the selected scenario set.")
+        st.warning(f"Estimated profit risk: ${abs(total_profit_impact):,.2f}.")
+with risk2:
+    negative_options = int((scenario_df["Lead Time Reduction Days"] < 0).sum())
+    st.warning(f"{negative_options} factory option(s) are slower than the current assignment.") if negative_options else st.success("No slower option was predicted for this scenario.")
 
 st.subheader("Route & Product Clustering")
 route_df = create_route_clusters(df)
-fig_cluster = px.scatter(
-    route_df,
-    x="Total_Orders",
-    y="Avg_Lead_Time",
-    color="Status",
-    size="Avg_Gross_Profit",
-    hover_data=["Origin Factory", "Region", "Product Name"],
-    title="Route Performance Clusters",
-)
+fig_cluster = px.scatter(route_df, x="Total_Orders", y="Avg_Lead_Time", color="Status", size="Avg_Gross_Profit", hover_data=["Origin Factory", "Region", "Product Name"], title="Route Performance Clusters")
 st.plotly_chart(fig_cluster, use_container_width=True)
 
 st.subheader("Network Reallocation Map")
-map_view = st.radio(
-    "Map view",
-    ["Selected product scenario", "Top-N network recommendations"],
-    horizontal=True,
-)
-
+map_view = st.radio("Map view", ["Selected product scenario", "Top-N network recommendations"], horizontal=True)
 if map_view == "Selected product scenario":
-    map_recommendations = recommended_df.head(1).copy()
+    map_recommendations = best_recommendation.copy()
     map_title = f"Selected Product Relocation Path: {selected_product}"
 else:
     map_recommendations = all_recommendations.head(top_n).copy()
@@ -584,74 +441,16 @@ else:
 
 map_rows = []
 for factory, coords in FACTORY_COORDS.items():
-    status = "Standard Facility"
-    if not map_recommendations.empty:
-        is_source = factory in map_recommendations["Current Factory"].values
-        is_destination = factory in map_recommendations["Factory"].values
-        if is_source and is_destination:
-            status = "Source & Destination"
-        elif is_source:
-            status = "Move Away"
-        elif is_destination:
-            status = "Recommended Destination"
-    map_rows.append(
-        {
-            "Factory": factory,
-            "Lat": coords["lat"],
-            "Lon": coords["lon"],
-            "Status": status,
-        }
-    )
+    source = not map_recommendations.empty and factory in map_recommendations["Current Factory"].values
+    destination = not map_recommendations.empty and factory in map_recommendations["Factory"].values
+    status = "Source & Destination" if source and destination else "Move Away" if source else "Recommended Destination" if destination else "Standard Facility"
+    map_rows.append({"Factory": factory, "Lat": coords["lat"], "Lon": coords["lon"], "Status": status})
 
-map_df = pd.DataFrame(map_rows)
-fig_map = px.scatter_geo(
-    map_df,
-    lat="Lat",
-    lon="Lon",
-    text="Factory",
-    color="Status",
-    projection="albers usa",
-    color_discrete_map={
-        "Standard Facility": "#4C78A8",
-        "Move Away": "#E45756",
-        "Recommended Destination": "#54A24B",
-        "Source & Destination": "#F58518",
-    },
-)
-
-if not map_recommendations.empty:
-    for _, row in map_recommendations.iterrows():
-        source = FACTORY_COORDS[row["Current Factory"]]
-        destination = FACTORY_COORDS[row["Factory"]]
-        fig_map.add_scattergeo(
-            lon=[source["lon"], destination["lon"]],
-            lat=[source["lat"], destination["lat"]],
-            mode="lines",
-            line=dict(
-                width=max(2, min(8, abs(row["Lead Time Reduction (%)"]) / 4)),
-                color="#111827",
-            ),
-            opacity=0.75,
-            hovertemplate=(
-                f"<b>{row['Product']}</b><br>"
-                f"{row['Current Factory']} to {row['Factory']}<br>"
-                f"Lead-time reduction: {row['Lead Time Reduction (%)']:.2f}%<br>"
-                f"Profit impact: ${row['Profit Impact']:,.2f}"
-                "<extra></extra>"
-            ),
-            showlegend=False,
-        )
-else:
-    st.info("No positive reassignment path for this map view. Current allocation is best under the selected filters.")
-
-fig_map.update_traces(
-    marker=dict(size=16, line=dict(width=2, color="white")),
-    textfont=dict(size=13, color="black"),
-)
+fig_map = px.scatter_geo(pd.DataFrame(map_rows), lat="Lat", lon="Lon", text="Factory", color="Status", projection="albers usa", color_discrete_map={"Standard Facility": "#4C78A8", "Move Away": "#E45756", "Recommended Destination": "#54A24B", "Source & Destination": "#F58518"})
+for _, row in map_recommendations.iterrows():
+    source, destination = FACTORY_COORDS[row["Current Factory"]], FACTORY_COORDS[row["Factory"]]
+    fig_map.add_scattergeo(lon=[source["lon"], destination["lon"]], lat=[source["lat"], destination["lat"]], mode="lines", line={"width": 3, "color": "#111827"}, hovertemplate=f"<b>{row['Product']}</b><br>{row['Current Factory']} to {row['Factory']}<br>Lead-time reduction: {row['Lead Time Reduction (%)']:.2f}%<extra></extra>", showlegend=False)
+fig_map.update_traces(marker={"size": 16, "line": {"width": 2, "color": "white"}}, textfont={"size": 13, "color": "black"}, selector={"mode": "markers+text"})
 fig_map.update_geos(showland=True, landcolor="#F3F4F6", showcountries=True)
-fig_map.update_layout(
-    title=map_title,
-    height=600,
-    margin={"r": 0, "t": 40, "l": 0, "b": 0},
-)
+fig_map.update_layout(title=map_title, height=600, margin={"r": 0, "t": 40, "l": 0, "b": 0})
 st.plotly_chart(fig_map, use_container_width=True)
