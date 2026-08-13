@@ -353,7 +353,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Selected Model", winning_model_name)
 m2.metric("RMSE", f"{best_metrics['RMSE']:.2f}")
 m3.metric("MAE", f"{best_metrics['MAE']:.2f}")
-m4.metric("R2", f"{test_r2:.4f}")
+m4.metric("R²", f"{test_r2:.4f}")
 if test_r2 <= 0:
     st.error(
         "The best model does not outperform the mean-lead-time baseline. "
